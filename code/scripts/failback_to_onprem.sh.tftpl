@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION_CODE="${region_code}"
+AZURE_HOST="${azure_host}"
+AZURE_USER="${azure_user}"
+AZURE_PASSWORD_B64="${azure_password_b64}"
+ONPREM_HOST="${onprem_host}"
+ONPREM_PORT="${onprem_port}"
+ONPREM_DB="${db_name}"
+ONPREM_USER="${onprem_admin_user}"
+ONPREM_PASSWORD_B64="${onprem_admin_password_b64}"
+
+AZURE_PASSWORD="$(printf '%s' "$AZURE_PASSWORD_B64" | base64 -d)"
+ONPREM_PASSWORD="$(printf '%s' "$ONPREM_PASSWORD_B64" | base64 -d)"
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+AZURE_DUMP="/tmp/${region_code}_${db_name}_failback_$${STAMP}.sql"
+ONPREM_BACKUP="/tmp/onprem_${db_name}_before_failback_$${STAMP}.sql.gz"
+
+azure_mysql() {
+  MYSQL_PWD="$AZURE_PASSWORD" mysql --protocol=TCP --ssl-mode=REQUIRED \
+    -h "$AZURE_HOST" -P 3306 -u "$AZURE_USER" "$@"
+}
+
+onprem_mysql() {
+  MYSQL_PWD="$ONPREM_PASSWORD" mysql --protocol=TCP --ssl-mode=DISABLED \
+    -h "$ONPREM_HOST" -P "$ONPREM_PORT" -u "$ONPREM_USER" "$@"
+}
+
+printf '\n=== [%s] Controlled DB Failback: Azure -> On-Prem ===\n' "$REGION_CODE"
+printf 'Failback source : %s/%s\n' "$AZURE_HOST" "$ONPREM_DB"
+printf 'Failback target : %s:%s/%s\n' "$ONPREM_HOST" "$ONPREM_PORT" "$ONPREM_DB"
+printf 'IMPORTANT: application writes must be held on Azure (db_proxy_force_standby=true) during this operation.\n'
+
+printf '\n[1/7] Verify source and target connectivity\n'
+azure_mysql -Nse "SELECT VERSION(), @@hostname;"
+onprem_mysql -Nse "SELECT VERSION(), @@hostname;"
+
+printf '\n[2/7] Freeze old Data-in relationship on Azure source\n'
+azure_mysql -e "CALL mysql.az_replication_stop();" >/dev/null 2>&1 || true
+azure_mysql -e "CALL mysql.az_replication_remove_master();" >/dev/null 2>&1 || true
+
+printf '\n[3/7] Create safety backup of current On-Prem database\n'
+MYSQL_PWD="$ONPREM_PASSWORD" mysqldump --protocol=TCP --ssl-mode=DISABLED \
+  -h "$ONPREM_HOST" -P "$ONPREM_PORT" -u "$ONPREM_USER" \
+  --single-transaction --routines --triggers --events --hex-blob --set-gtid-purged=OFF \
+  "$ONPREM_DB" | gzip -c > "$ONPREM_BACKUP"
+echo "Safety backup: $ONPREM_BACKUP"
+
+printf '\n[4/7] Dump latest data from temporary Azure Primary\n'
+MYSQL_PWD="$AZURE_PASSWORD" mysqldump --protocol=TCP --ssl-mode=REQUIRED \
+  -h "$AZURE_HOST" -P 3306 -u "$AZURE_USER" \
+  --single-transaction --routines --triggers --events --hex-blob --set-gtid-purged=OFF \
+  "$ONPREM_DB" > "$AZURE_DUMP"
+
+printf '\n[5/7] Replace On-Prem application database with Azure failover snapshot\n'
+onprem_mysql -e "DROP DATABASE IF EXISTS \`${db_name}\`; CREATE DATABASE \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+MYSQL_PWD="$ONPREM_PASSWORD" mysql --protocol=TCP --ssl-mode=DISABLED \
+  -h "$ONPREM_HOST" -P "$ONPREM_PORT" -u "$ONPREM_USER" "$ONPREM_DB" < "$AZURE_DUMP"
+
+printf '\n[6/7] Verify table inventory and row counts\n'
+COUNT_SQL="SELECT TABLE_NAME, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA='${db_name}' ORDER BY TABLE_NAME;"
+echo '--- Azure temporary Primary ---'
+azure_mysql -e "$COUNT_SQL"
+echo '--- Restored On-Prem ---'
+onprem_mysql -e "$COUNT_SQL"
+
+printf '\n[7/7] Failback seed complete\n'
+echo "On-Prem now contains the Azure failover snapshot."
+echo "Terraform will next reseed KRC/JPE from On-Prem and recreate continuous Data-in Replication."
+echo "Keep db_proxy_force_standby=true until the next replication resources report IO=Yes / SQL=Yes."
+
+rm -f "$AZURE_DUMP"

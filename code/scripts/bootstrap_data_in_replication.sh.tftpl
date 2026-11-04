@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION_CODE="${region_code}"
+SOURCE_HOST="${source_host}"
+SOURCE_PORT="${source_port}"
+SOURCE_DB="${source_db}"
+SOURCE_USER="${source_user}"
+SOURCE_PASSWORD_B64="${source_password_b64}"
+TARGET_HOST="${target_host}"
+TARGET_USER="${target_user}"
+TARGET_PASSWORD_B64="${target_password_b64}"
+
+SOURCE_PASSWORD="$(printf '%s' "$SOURCE_PASSWORD_B64" | base64 -d)"
+TARGET_PASSWORD="$(printf '%s' "$TARGET_PASSWORD_B64" | base64 -d)"
+
+DUMP_FILE="/tmp/${region_code}_${source_db}_initial.sql"
+STATUS_FILE="/tmp/${region_code}_${source_db}_replica_status.txt"
+
+source_mysql() {
+  MYSQL_PWD="$SOURCE_PASSWORD" mysql \
+    --protocol=TCP \
+    --ssl-mode=DISABLED \
+    -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u "$SOURCE_USER" "$@"
+}
+
+target_mysql() {
+  MYSQL_PWD="$TARGET_PASSWORD" mysql \
+    --protocol=TCP \
+    --ssl-mode=REQUIRED \
+    -h "$TARGET_HOST" -P 3306 -u "$TARGET_USER" "$@"
+}
+
+sql_escape() {
+  printf '%s' "$1" | sed "s/'/''/g"
+}
+
+SOURCE_HOST_SQL="$(sql_escape "$SOURCE_HOST")"
+SOURCE_USER_SQL="$(sql_escape "$SOURCE_USER")"
+SOURCE_PASSWORD_SQL="$(sql_escape "$SOURCE_PASSWORD")"
+
+printf '\n=== [%s] Data-in Replication Bootstrap ===\n' "$REGION_CODE"
+printf 'Source : %s:%s/%s\n' "$SOURCE_HOST" "$SOURCE_PORT" "$SOURCE_DB"
+printf 'Target : %s:3306/%s\n' "$TARGET_HOST" "$SOURCE_DB"
+
+printf '\n[1/6] Source MySQL prerequisite check\n'
+SERVER_ID="$(source_mysql -Nse "SELECT @@server_id;")"
+LOG_BIN="$(source_mysql -Nse "SELECT @@log_bin;")"
+BINLOG_FORMAT="$(source_mysql -Nse "SELECT @@binlog_format;")"
+
+printf 'server_id=%s, log_bin=%s, binlog_format=%s\n' "$SERVER_ID" "$LOG_BIN" "$BINLOG_FORMAT"
+
+if [ "$SERVER_ID" = "0" ]; then
+  echo "ERROR: source server_id must be non-zero." >&2
+  exit 20
+fi
+
+if [ "$LOG_BIN" != "1" ] && [ "$${LOG_BIN^^}" != "ON" ]; then
+  echo "ERROR: source log_bin must be ON." >&2
+  exit 21
+fi
+
+if [ "$${BINLOG_FORMAT^^}" != "ROW" ]; then
+  echo "ERROR: source binlog_format must be ROW." >&2
+  exit 22
+fi
+
+printf '\n[2/6] Create consistent source dump and capture binlog coordinates\n'
+MYSQL_PWD="$SOURCE_PASSWORD" mysqldump \
+  --protocol=TCP \
+  --ssl-mode=DISABLED \
+  -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u "$SOURCE_USER" \
+  --single-transaction \
+  --triggers \
+  --hex-blob \
+  --set-gtid-purged=OFF \
+  --source-data=2 \
+  "$SOURCE_DB" > "$DUMP_FILE"
+
+CHANGE_LINE="$(grep -m1 -E 'CHANGE MASTER TO|CHANGE REPLICATION SOURCE TO' "$DUMP_FILE" || true)"
+BINLOG_FILE="$(printf '%s\n' "$CHANGE_LINE" | sed -nE "s/.*(MASTER_LOG_FILE|SOURCE_LOG_FILE)='([^']+)'.*/\\2/p")"
+BINLOG_POS="$(printf '%s\n' "$CHANGE_LINE" | sed -nE 's/.*(MASTER_LOG_POS|SOURCE_LOG_POS)=([0-9]+).*/\2/p')"
+
+if [ -z "$BINLOG_FILE" ] || [ -z "$BINLOG_POS" ]; then
+  echo "ERROR: Could not parse binlog file/position from mysqldump output." >&2
+  echo "CHANGE line: $CHANGE_LINE" >&2
+  exit 23
+fi
+
+printf 'Captured source position: %s / %s\n' "$BINLOG_FILE" "$BINLOG_POS"
+
+printf '\n[3/6] Verify target Azure MySQL connectivity\n'
+target_mysql -Nse "SELECT VERSION(), @@hostname;"
+
+printf '\n[4/6] Reset previous Data-in relationship if present and reseed target database\n'
+target_mysql -e "CALL mysql.az_replication_stop();" >/dev/null 2>&1 || true
+target_mysql -e "CALL mysql.az_replication_remove_master();" >/dev/null 2>&1 || true
+
+target_mysql -e "DROP DATABASE IF EXISTS \`${source_db}\`; CREATE DATABASE \`${source_db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+MYSQL_PWD="$TARGET_PASSWORD" mysql \
+  --protocol=TCP \
+  --ssl-mode=REQUIRED \
+  -h "$TARGET_HOST" -P 3306 -u "$TARGET_USER" \
+  "$SOURCE_DB" < "$DUMP_FILE"
+
+printf '\n[5/6] Configure and start Azure MySQL Data-in Replication\n'
+target_mysql -e "CALL mysql.az_replication_change_master('$${SOURCE_HOST_SQL}', '$${SOURCE_USER_SQL}', '$${SOURCE_PASSWORD_SQL}', ${source_port}, '$${BINLOG_FILE}', $${BINLOG_POS}, '');"
+target_mysql -e "CALL mysql.az_replication_start();"
+
+printf '\n[6/6] Wait for replication threads and verify status\n'
+OK=0
+for attempt in $(seq 1 18); do
+  target_mysql -e "SHOW REPLICA STATUS\\G" > "$STATUS_FILE" || true
+  IO_STATE="$(awk -F': ' '/Replica_IO_Running:|Slave_IO_Running:/ {print $2; exit}' "$STATUS_FILE" | tr -d '\r')"
+  SQL_STATE="$(awk -F': ' '/Replica_SQL_Running:|Slave_SQL_Running:/ {print $2; exit}' "$STATUS_FILE" | tr -d '\r')"
+  LAG="$(awk -F': ' '/Seconds_Behind_Source:|Seconds_Behind_Master:/ {print $2; exit}' "$STATUS_FILE" | tr -d '\r')"
+
+  printf 'attempt=%s IO=%s SQL=%s lag=%s\n' "$attempt" "$${IO_STATE:-N/A}" "$${SQL_STATE:-N/A}" "$${LAG:-N/A}"
+
+  if [ "$IO_STATE" = "Yes" ] && [ "$SQL_STATE" = "Yes" ]; then
+    OK=1
+    break
+  fi
+  sleep 5
+done
+
+if [ "$OK" -ne 1 ]; then
+  echo "ERROR: Data-in replication did not reach IO=Yes / SQL=Yes." >&2
+  cat "$STATUS_FILE" >&2 || true
+  exit 24
+fi
+
+printf '\n=== [%s] Data-in Replication READY ===\n' "$REGION_CODE"
+printf 'Source position : %s / %s\n' "$BINLOG_FILE" "$BINLOG_POS"
+printf 'Replica IO      : %s\n' "$IO_STATE"
+printf 'Replica SQL     : %s\n' "$SQL_STATE"
+printf 'Replica lag     : %s\n' "$${LAG:-N/A}"
+
+rm -f "$DUMP_FILE"

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REGION_CODE="${region_code}"
+TARGET_HOST="${target_host}"
+TARGET_USER="${target_user}"
+TARGET_PASSWORD_B64="${target_password_b64}"
+TARGET_PASSWORD="$(printf '%s' "$TARGET_PASSWORD_B64" | base64 -d)"
+
+target_mysql() {
+  MYSQL_PWD="$TARGET_PASSWORD" mysql --protocol=TCP --ssl-mode=REQUIRED \
+    -h "$TARGET_HOST" -P 3306 -u "$TARGET_USER" "$@"
+}
+
+printf '\n=== [%s] Promote Azure MySQL to temporary writable Primary ===\n' "$REGION_CODE"
+target_mysql -Nse "SELECT VERSION(), @@hostname, @@read_only;"
+
+# Stop/remove the old On-Prem -> Azure replication relationship so the temporary
+# Primary cannot unexpectedly resume consuming the old source after On-Prem recovers.
+target_mysql -e "CALL mysql.az_replication_stop();" >/dev/null 2>&1 || true
+target_mysql -e "CALL mysql.az_replication_remove_master();" >/dev/null 2>&1 || true
+
+STATUS="$(target_mysql -e 'SHOW REPLICA STATUS\\G' 2>/dev/null || true)"
+if [ -n "$STATUS" ]; then
+  echo "WARNING: replica status still exists after promotion:" >&2
+  echo "$STATUS" >&2
+else
+  echo "Replication relationship removed. Azure DB is ready to act as temporary Primary."
+fi
